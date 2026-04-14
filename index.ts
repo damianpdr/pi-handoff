@@ -22,25 +22,40 @@ const COUNTDOWN_SECONDS = 10;
 
 const SYSTEM_PROMPT = `You are a context transfer assistant.
 
-Given a conversation history and a user's goal for a new thread, produce a focused starter prompt for the new thread.
+Given a conversation history and the user's goal for a new thread, write a comprehensive handoff document for another instance of the assistant.
 
 Requirements:
-1) Include only relevant context from the prior thread.
-2) Capture key decisions, constraints, and unresolved risks.
-3) List files that matter (only if mentioned/edited).
-4) Include the source session file path under Files when provided.
-5) End with a clear, actionable task for the new thread.
-6) Keep it concise and self-contained.
+1) The handoff must be sufficient for seamless continuation without access to the old conversation.
+2) Capture exact technical state, not abstractions.
+3) Include concrete file paths, symbol names, commands run, test results, observed failures, decisions made, and partial work when materially relevant.
+4) Keep only context relevant to the new goal.
+5) Output only the handoff document. No preamble or commentary.
 
 Output format:
-## Context
-- ...
+## Goal
+[What the user is trying to accomplish next]
 
-## Files
-- path/to/file
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned]
 
-## Task
-...`;
+## Progress
+### Done
+- [x] [Completed tasks with specifics]
+
+### In Progress
+- [ ] [Current work if any]
+
+### Pending
+- [ ] [Tasks mentioned but not started]
+
+## Key Decisions
+- **[Decision]**: [Rationale]
+
+## Critical Context
+- [Concrete file paths, symbols, commands, test results, errors, or repository state essential to continue]
+
+## Next Steps
+1. [What should happen next]`;
 
 const QUERY_SYSTEM_PROMPT = `You answer questions about a prior pi session.
 
@@ -458,7 +473,7 @@ export default function (pi: ExtensionAPI) {
         ? `**Parent session:** \`${currentSessionFile}\`\n\nUse tool \`session_query\` with this path when details from prior thread are needed.\n\n`
         : "";
 
-      const prefillDraft = `${goal}\n\n${parentSessionBlock}${generatedPrompt}`.trim();
+      const prefillDraft = `${parentSessionBlock}${generatedPrompt}`.trim();
 
       const editedPrompt = await ctx.ui.editor("Edit handoff draft", prefillDraft);
       if (editedPrompt === undefined) {
