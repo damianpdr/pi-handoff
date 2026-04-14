@@ -201,19 +201,15 @@ export default function (pi: ExtensionAPI) {
     };
   };
 
+  pi.on("session_start", (_event, ctx) => {
+    if (pending) clearPending(ctx);
+  });
+
   pi.on("session_before_switch", (_event, ctx) => {
     if (pending) clearPending(ctx);
   });
 
-  pi.on("session_switch", (_event, ctx) => {
-    if (pending) clearPending(ctx);
-  });
-
   pi.on("session_before_fork", (_event, ctx) => {
-    if (pending) clearPending(ctx);
-  });
-
-  pi.on("session_fork", (_event, ctx) => {
     if (pending) clearPending(ctx);
   });
 
@@ -231,9 +227,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "session_query",
-    label: (params) => `Session Query: ${params.question}`,
+    label: "Session Query",
     description:
       "Query a prior pi session file. Use when handoff prompt references a parent session and you need details.",
+    promptSnippet: "Query an older pi session file for facts needed by the current thread",
+    promptGuidelines: [
+      "Use this when a handoff references a parent session and you need concrete details from that older session.",
+      "Ask focused factual questions; do not use this as a generic search over unrelated sessions.",
+    ],
     parameters: Type.Object({
       sessionPath: Type.String({
         description:
@@ -256,7 +257,7 @@ export default function (pi: ExtensionAPI) {
         details: { cancelled: true },
       });
 
-      if (signal.aborted) {
+      if (signal?.aborted) {
         return cancelled();
       }
 
@@ -313,7 +314,11 @@ export default function (pi: ExtensionAPI) {
 
       const conversationText = serializeConversation(convertToLlm(messages));
       try {
-        const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+        if (!auth.ok || !auth.apiKey) {
+          return error(auth.ok ? `No API key for ${ctx.model.provider}` : auth.error);
+        }
+
         const userMessage: Message = {
           role: "user",
           content: [
@@ -328,7 +333,7 @@ export default function (pi: ExtensionAPI) {
         const response = await complete(
           ctx.model,
           { systemPrompt: QUERY_SYSTEM_PROMPT, messages: [userMessage] },
-          { apiKey, signal },
+          { apiKey: auth.apiKey, headers: auth.headers, signal },
         );
 
         if (response.stopReason === "aborted") {
@@ -350,7 +355,7 @@ export default function (pi: ExtensionAPI) {
           },
         };
       } catch (err) {
-        if (signal.aborted) {
+        if (signal?.aborted) {
           return cancelled();
         }
         if (err instanceof Error && err.name === "AbortError") {
@@ -403,7 +408,10 @@ export default function (pi: ExtensionAPI) {
         loader.onAbort = () => done(null);
 
         const run = async () => {
-          const apiKey = await ctx.modelRegistry.getApiKey(ctx.model!);
+          const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model!);
+          if (!auth.ok || !auth.apiKey) {
+            throw new Error(auth.ok ? `No API key for ${ctx.model!.provider}` : auth.error);
+          }
 
           const userMessage: Message = {
             role: "user",
@@ -419,7 +427,7 @@ export default function (pi: ExtensionAPI) {
           const response = await complete(
             ctx.model!,
             { systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
-            { apiKey, signal: loader.signal },
+            { apiKey: auth.apiKey, headers: auth.headers, signal: loader.signal },
           );
 
           if (response.stopReason === "aborted") return null;

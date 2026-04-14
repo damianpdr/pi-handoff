@@ -14,9 +14,10 @@ Pi extension for session handoff workflows.
 
 ## Install
 1. Clone this repo.
-2. Copy `index.ts` to:
-   - `~/.pi/agent/extensions/handoff/index.ts`
-3. Restart pi.
+2. Copy `index.ts` to either:
+   - `~/.pi/agent/extensions/handoff/index.ts` (global)
+   - `.pi/extensions/handoff/index.ts` (project-local)
+3. Restart pi or run `/reload`.
 
 ## Usage
 - In a session: `/handoff <goal>`
@@ -24,4 +25,5 @@ Pi extension for session handoff workflows.
 
 ## Notes
 - Requires model access for generation/query (`@mariozechner/pi-ai` complete API).
-- Extension targets pi coding agent extension API (`@mariozechner/pi-coding-agent`).
+- Updated for the current pi coding agent extension API (`@mariozechner/pi-coding-agent`).
+- Uses current session events and `modelRegistry.getApiKeyAndHeaders()` for generation/query auth.
