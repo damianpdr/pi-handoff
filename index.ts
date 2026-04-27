@@ -2,7 +2,6 @@ import { complete, type Message } from "@mariozechner/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
-  ExtensionContext,
   SessionEntry,
 } from "@mariozechner/pi-coding-agent";
 import {
@@ -11,14 +10,11 @@ import {
   convertToLlm,
   serializeConversation,
 } from "@mariozechner/pi-coding-agent";
-import { Key, matchesKey } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
-const STATUS_KEY = "handoff";
-const COUNTDOWN_SECONDS = 10;
 
 const SYSTEM_PROMPT = `You are a context transfer assistant.
 
@@ -65,33 +61,93 @@ Rules:
 - If not present, say explicitly: "Not found in provided session.".
 - Keep answer concise.`;
 
-type PendingAutoSubmit = {
-  ctx: ExtensionContext;
-  sessionFile: string | undefined;
-  interval: ReturnType<typeof setInterval>;
-  unsubscribeInput: () => void;
+const MAX_CONVERSATION_CHARS = 120_000;
+const CONVERSATION_HEAD_CHARS = 20_000;
+const COMMAND_TIMEOUT_MS = 2_000;
+const COMMAND_MAX_BUFFER = 512 * 1024;
+
+type PreparedConversation = {
+  text: string;
+  originalChars: number;
+  truncatedChars: number;
 };
 
-function isEditableInput(data: string): boolean {
-  if (!data) return false;
-  if (data.length === 1) {
-    const code = data.charCodeAt(0);
-    if (code >= 32 && code !== 127) return true;
-    if (code === 8 || code === 13) return true;
-  }
+type HandoffGenerationResult =
+  | { ok: true; text: string }
+  | { ok: false; cancelled: true }
+  | { ok: false; cancelled: false; error: string };
 
-  if (data === "\n" || data === "\r") return true;
-  if (data === "\x7f") return true;
-
-  if (data.length > 1 && !data.startsWith("\x1b")) return true;
-
-  return false;
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
-function statusLine(ctx: ExtensionContext, seconds: number): string {
-  const accent = ctx.ui.theme.fg("accent", `handoff auto-submit in ${seconds}s`);
-  const hint = ctx.ui.theme.fg("dim", "(type to edit, Esc to cancel)");
-  return `${accent} ${hint}`;
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text.trim();
+  return `${text.slice(0, maxChars).trimEnd()}\n… [truncated ${text.length - maxChars} chars]`;
+}
+
+function prepareConversation(conversationText: string): PreparedConversation {
+  if (conversationText.length <= MAX_CONVERSATION_CHARS) {
+    return { text: conversationText, originalChars: conversationText.length, truncatedChars: 0 };
+  }
+
+  const tailChars = MAX_CONVERSATION_CHARS - CONVERSATION_HEAD_CHARS;
+  const head = conversationText.slice(0, CONVERSATION_HEAD_CHARS).trimEnd();
+  const tail = conversationText.slice(-tailChars).trimStart();
+  const omitted = conversationText.length - head.length - tail.length;
+  const marker = `\n\n[... ${omitted} characters omitted from the middle of a long session. Earlier setup and the latest turns are preserved. Use session_query against the parent session if deeper history is needed. ...]\n\n`;
+
+  return {
+    text: `${head}${marker}${tail}`,
+    originalChars: conversationText.length,
+    truncatedChars: omitted,
+  };
+}
+
+function runGit(cwd: string, args: string[], maxChars = 20_000): string | undefined {
+  try {
+    const output = execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: COMMAND_TIMEOUT_MS,
+      maxBuffer: COMMAND_MAX_BUFFER,
+    });
+    return truncateText(output.trim(), maxChars);
+  } catch {
+    return undefined;
+  }
+}
+
+function collectRepositoryState(cwd = process.cwd()): string {
+  const root = runGit(cwd, ["rev-parse", "--show-toplevel"], 4_000);
+  if (!root) {
+    return `Current working directory: ${cwd}\nGit repository: not detected from this working directory.`;
+  }
+
+  const branch = runGit(root, ["branch", "--show-current"], 1_000) || "(detached or unknown)";
+  const status = runGit(root, ["status", "--short", "--branch"], 30_000) || "(unable to read status)";
+  const unstagedStat = runGit(root, ["diff", "--stat", "--"], 20_000) || "(no unstaged diff)";
+  const stagedStat = runGit(root, ["diff", "--cached", "--stat", "--"], 20_000) || "(no staged diff)";
+  const recentCommits = runGit(root, ["log", "--oneline", "-5"], 10_000) || "(no recent commits available)";
+
+  return [
+    `Current working directory: ${cwd}`,
+    `Repository root: ${root}`,
+    `Current branch: ${branch}`,
+    "",
+    "### Git status",
+    status,
+    "",
+    "### Unstaged diff stat",
+    unstagedStat,
+    "",
+    "### Staged diff stat",
+    stagedStat,
+    "",
+    "### Recent commits",
+    recentCommits,
+  ].join("\n");
 }
 
 function getSessionsRoot(sessionFile: string | undefined): string | undefined {
@@ -127,119 +183,6 @@ function sessionPathAllowed(candidate: string, sessionsRoot: string | undefined)
 }
 
 export default function (pi: ExtensionAPI) {
-  let pending: PendingAutoSubmit | null = null;
-
-  const clearPending = (ctx?: ExtensionContext, notify?: string) => {
-    if (!pending) return;
-
-    clearInterval(pending.interval);
-    pending.unsubscribeInput();
-    pending.ctx.ui.setStatus(STATUS_KEY, undefined);
-
-    const local = pending;
-    pending = null;
-
-    if (notify && ctx) {
-      ctx.ui.notify(notify, "info");
-    } else if (notify) {
-      local.ctx.ui.notify(notify, "info");
-    }
-  };
-
-  const autoSubmitDraft = () => {
-    if (!pending) return;
-
-    const active = pending;
-    const currentSession = active.ctx.sessionManager.getSessionFile();
-    if (active.sessionFile && currentSession !== active.sessionFile) {
-      clearPending(undefined);
-      return;
-    }
-
-    const draft = active.ctx.ui.getEditorText().trim();
-    clearPending(undefined);
-
-    if (!draft) {
-      active.ctx.ui.notify("Handoff draft is empty", "warning");
-      return;
-    }
-
-    active.ctx.ui.setEditorText("");
-
-    try {
-      if (active.ctx.isIdle()) {
-        pi.sendUserMessage(draft);
-      } else {
-        pi.sendUserMessage(draft, { deliverAs: "followUp" });
-      }
-    } catch {
-      pi.sendUserMessage(draft);
-    }
-  };
-
-  const startCountdown = (ctx: ExtensionContext) => {
-    clearPending(ctx);
-
-    let seconds = COUNTDOWN_SECONDS;
-    ctx.ui.setStatus(STATUS_KEY, statusLine(ctx, seconds));
-
-    const unsubscribeInput = ctx.ui.onTerminalInput((data) => {
-      if (matchesKey(data, Key.escape)) {
-        clearPending(ctx, "Handoff auto-submit cancelled");
-        return { consume: true };
-      }
-
-      if (isEditableInput(data)) {
-        clearPending(ctx, "Handoff auto-submit stopped (editing)");
-      }
-
-      return undefined;
-    });
-
-    const interval = setInterval(() => {
-      if (!pending) return;
-
-      seconds -= 1;
-      if (seconds <= 0) {
-        autoSubmitDraft();
-        return;
-      }
-
-      ctx.ui.setStatus(STATUS_KEY, statusLine(ctx, seconds));
-    }, 1000);
-
-    pending = {
-      ctx,
-      sessionFile: ctx.sessionManager.getSessionFile(),
-      interval,
-      unsubscribeInput,
-    };
-  };
-
-  pi.on("session_start", (_event, ctx) => {
-    if (pending) clearPending(ctx);
-  });
-
-  pi.on("session_before_switch", (_event, ctx) => {
-    if (pending) clearPending(ctx);
-  });
-
-  pi.on("session_before_fork", (_event, ctx) => {
-    if (pending) clearPending(ctx);
-  });
-
-  pi.on("session_before_tree", (_event, ctx) => {
-    if (pending) clearPending(ctx);
-  });
-
-  pi.on("session_tree", (_event, ctx) => {
-    if (pending) clearPending(ctx);
-  });
-
-  pi.on("session_shutdown", (_event, ctx) => {
-    if (pending) clearPending(ctx);
-  });
-
   pi.registerTool({
     name: "session_query",
     label: "Session Query",
@@ -382,7 +325,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("handoff", {
-    description: "Create a new session with inherited context and auto-submit draft",
+    description: "Create a new session and auto-submit a handoff summary",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("/handoff requires interactive mode", "error");
@@ -394,15 +337,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      let goal = args.trim();
-      if (!goal) {
-        const entered = await ctx.ui.input("handoff goal", "What should the new thread do?");
-        if (!entered?.trim()) {
-          ctx.ui.notify("Handoff cancelled", "info");
-          return;
-        }
-        goal = entered.trim();
-      }
+      const goal = args.trim() || "Continue from the current conversation in a new session.";
 
       const branch = ctx.sessionManager.getBranch();
       const messages = branch
@@ -416,16 +351,25 @@ export default function (pi: ExtensionAPI) {
 
       const llmMessages = convertToLlm(messages);
       const conversationText = serializeConversation(llmMessages);
+      const preparedConversation = prepareConversation(conversationText);
+      const repositoryState = collectRepositoryState();
       const currentSessionFile = ctx.sessionManager.getSessionFile();
+      const truncationNotice = preparedConversation.truncatedChars
+        ? `\n\n## Conversation Truncation Notice\n\nThe serialized conversation was ${preparedConversation.originalChars} characters, so ${preparedConversation.truncatedChars} middle characters were omitted before handoff generation. The first ${CONVERSATION_HEAD_CHARS} characters and latest turns were preserved. The generated handoff should mention that the new session can use session_query on the parent session if omitted history is needed.`
+        : "";
 
-      const generatedPrompt = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-        const loader = new BorderedLoader(tui, theme, "Generating handoff draft...");
-        loader.onAbort = () => done(null);
+      const generatedPrompt = await ctx.ui.custom<HandoffGenerationResult>((tui, theme, _kb, done) => {
+        const loader = new BorderedLoader(tui, theme, "Generating handoff summary...");
+        loader.onAbort = () => done({ ok: false, cancelled: true });
 
-        const run = async () => {
+        const run = async (): Promise<HandoffGenerationResult> => {
           const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model!);
           if (!auth.ok || !auth.apiKey) {
-            throw new Error(auth.ok ? `No API key for ${ctx.model!.provider}` : auth.error);
+            return {
+              ok: false,
+              cancelled: false,
+              error: auth.ok ? `No API key for ${ctx.model!.provider}` : auth.error,
+            };
           }
 
           const userMessage: Message = {
@@ -433,7 +377,7 @@ export default function (pi: ExtensionAPI) {
             content: [
               {
                 type: "text",
-                text: `## Source Session File\n\n${currentSessionFile ?? "(unknown)"}\n\n## Conversation\n\n${conversationText}\n\n## Goal\n\n${goal}`,
+                text: `## Source Session File\n\n${currentSessionFile ?? "(unknown)"}\n\n## Repository State\n\n${repositoryState}${truncationNotice}\n\n## Conversation\n\n${preparedConversation.text}\n\n## Goal\n\n${goal}`,
               },
             ],
             timestamp: Date.now(),
@@ -445,27 +389,42 @@ export default function (pi: ExtensionAPI) {
             { apiKey: auth.apiKey, headers: auth.headers, signal: loader.signal },
           );
 
-          if (response.stopReason === "aborted") return null;
+          if (response.stopReason === "aborted") {
+            return { ok: false, cancelled: true };
+          }
 
-          return response.content
+          const text = response.content
             .filter((c): c is { type: "text"; text: string } => c.type === "text")
             .map((c) => c.text)
             .join("\n")
             .trim();
+
+          if (!text) {
+            return { ok: false, cancelled: false, error: "Model returned an empty handoff summary." };
+          }
+
+          return { ok: true, text };
         };
 
         run()
           .then(done)
           .catch((err) => {
             console.error("handoff generation failed", err);
-            done(null);
+            if (loader.signal.aborted) {
+              done({ ok: false, cancelled: true });
+              return;
+            }
+            done({ ok: false, cancelled: false, error: errorMessage(err) });
           });
 
         return loader;
       });
 
-      if (!generatedPrompt) {
-        ctx.ui.notify("Handoff cancelled", "info");
+      if (!generatedPrompt.ok) {
+        ctx.ui.notify(
+          generatedPrompt.cancelled ? "Handoff cancelled" : `Handoff generation failed: ${generatedPrompt.error}`,
+          generatedPrompt.cancelled ? "info" : "error",
+        );
         return;
       }
 
@@ -473,30 +432,23 @@ export default function (pi: ExtensionAPI) {
         ? `**Parent session:** \`${currentSessionFile}\`\n\nUse tool \`session_query\` with this path when details from prior thread are needed.\n\n`
         : "";
 
-      const prefillDraft = `${parentSessionBlock}${generatedPrompt}`.trim();
-
-      const editedPrompt = await ctx.ui.editor("Edit handoff draft", prefillDraft);
-      if (editedPrompt === undefined) {
-        ctx.ui.notify("Handoff cancelled", "info");
-        return;
-      }
+      const handoffSummary = `${parentSessionBlock}${generatedPrompt.text}`.trim();
 
       const next = await ctx.newSession({
         parentSession: currentSessionFile,
+        withSession: async (replacementCtx) => {
+          const newSessionFile = replacementCtx.sessionManager.getSessionFile();
+          if (newSessionFile) {
+            replacementCtx.ui.notify(`Switched to new session: ${newSessionFile}`, "info");
+          }
+
+          await replacementCtx.sendUserMessage(handoffSummary);
+        },
       });
 
       if (next.cancelled) {
         ctx.ui.notify("New session cancelled", "info");
-        return;
       }
-
-      const newSessionFile = ctx.sessionManager.getSessionFile();
-      if (newSessionFile) {
-        ctx.ui.notify(`Switched to new session: ${newSessionFile}`, "info");
-      }
-
-      ctx.ui.setEditorText(editedPrompt);
-      startCountdown(ctx);
     },
   });
 }
